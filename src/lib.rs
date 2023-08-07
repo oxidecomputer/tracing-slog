@@ -1,135 +1,123 @@
-//! Adapters for connecting structured log records from the [slog] crate into the [tracing](https://github.com/tokio-rs/tracing) ecosystem.
-//!
-//! Use when a library uses `slog` but your application uses `tracing`.
-//!
-//! Heavily inspired by [tracing-log](https://github.com/tokio-rs/tracing/tree/5fdbcbf61da27ec3e600678121d8c00d2b9b5cb1/tracing-log).
-
-use once_cell::sync::Lazy;
-
+use slog::{Drain, Key, Serializer, KV};
+use std::collections::HashMap;
 use tracing_core::{
-    callsite, dispatcher, field, identify_callsite,
-    metadata::{Kind, Level},
-    subscriber, Event, Metadata,
+    callsite, dispatcher, field, identify_callsite, subscriber, Callsite, Event, Kind, Level,
+    Metadata,
 };
+use valuable::Valuable;
 
-/// A [slog Drain](slog::Drain) that converts [records](slog::Record) into [tracing events](Event).
-///
-/// To use, create a [slog logger](slog::Logger) using an instance of [TracingSlogDrain] as its drain:
-///
-/// ```rust
-/// # use slog::*;
-/// # use tracing_slog::TracingSlogDrain;
-/// let drain = TracingSlogDrain;
-/// let root = Logger::root(drain, o!());
-///
-/// info!(root, "logged using slogger");
-/// ```
+pub struct Bridge {
+    values: HashMap<String, String>,
+}
+
+impl Serializer for Bridge {
+    fn emit_arguments(&mut self, key: Key, val: &std::fmt::Arguments) -> slog::Result {
+        println!("{} {}", key, val);
+
+        self.values.insert(format!("{}", key), format!("{}", val));
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct TracingSlogDrain;
 
-impl slog::Drain for TracingSlogDrain {
+impl Drain for TracingSlogDrain {
     type Ok = ();
     type Err = slog::Never;
 
-    /// Converts a [slog record](slog::Record) into a [tracing event](Event)
-    /// and dispatches it to any registered tracing subscribers
-    /// using the [default dispatcher](dispatcher::get_default).
-    /// Currently, the key-value pairs are ignored.
     fn log(
         &self,
         record: &slog::Record<'_>,
-        _values: &slog::OwnedKVList,
+        values: &slog::OwnedKVList,
     ) -> Result<Self::Ok, Self::Err> {
         dispatcher::get_default(|dispatch| {
-            let filter_meta = slogrecord_to_trace(record);
-            if !dispatch.enabled(&filter_meta) {
-                return;
+            let bridge = get_callsite(record.level());
+            let cs = bridge.callsite();
+
+            if dispatch.enabled(cs.metadata()) {
+                let mut serializer = Bridge {
+                    values: HashMap::new(),
+                };
+                values.serialize(record, &mut serializer).unwrap();
+                record.kv().serialize(record, &mut serializer).unwrap();
+
+                dispatch.event(&Event::new(
+                    cs.metadata(),
+                    &cs.metadata().fields().value_set(&[
+                        (
+                            &bridge.field("message"),
+                            Some(record.msg() as &dyn field::Value),
+                        ),
+                        (&bridge.field("slog.module"), Some(&record.module())),
+                        (&bridge.field("slog.file"), Some(&record.file())),
+                        (&bridge.field("slog.line"), Some(&record.line())),
+                        (&bridge.field("slog.column"), Some(&record.column())),
+                        (
+                            &bridge.field("slog.kv"),
+                            Some(&serializer.values.as_value()),
+                        ),
+                    ]),
+                ));
             }
-
-            let (_, keys, meta) = sloglevel_to_cs(record.level());
-
-            let target = get_target(record);
-
-            dispatch.event(&Event::new(
-                meta,
-                &meta.fields().value_set(&[
-                    (&keys.message, Some(record.msg() as &dyn field::Value)),
-                    (&keys.target, Some(&target)),
-                    (&keys.module, Some(&record.module())),
-                    (&keys.file, Some(&record.file())),
-                    (&keys.line, Some(&record.line())),
-                    (&keys.column, Some(&record.column())),
-                ]),
-            ));
         });
 
         Ok(())
     }
 }
 
-fn get_target<'a>(record: &'a slog::Record<'a>) -> &'a str {
-    let target = record.tag();
-    if target.is_empty() {
-        record.module()
-    } else {
-        target
-    }
-}
-
-struct Fields {
-    message: field::Field,
-    target: field::Field,
-    module: field::Field,
-    file: field::Field,
-    line: field::Field,
-    column: field::Field,
-}
-
 static FIELD_NAMES: &[&str] = &[
     "message",
-    "slog.target",
-    "slog.module_path",
+    "slog.module",
     "slog.file",
     "slog.line",
     "slog.column",
+    "slog.kv",
 ];
 
-impl Fields {
-    fn new(cs: &'static dyn callsite::Callsite) -> Self {
-        let fieldset = cs.metadata().fields();
-        let message = fieldset.field("message").unwrap();
-        let target = fieldset.field("slog.target").unwrap();
-        let module = fieldset.field("slog.module_path").unwrap();
-        let file = fieldset.field("slog.file").unwrap();
-        let line = fieldset.field("slog.line").unwrap();
-        let column = fieldset.field("slog.column").unwrap();
-        Fields {
-            message,
-            target,
-            module,
-            file,
-            line,
-            column,
-        }
+fn get_callsite(level: slog::Level) -> &'static dyn BridgeCallsite {
+    match level {
+        slog::Level::Trace => &TraceCallsite,
+        slog::Level::Debug => &DebugCallsite,
+        slog::Level::Info => &InfoCallsite,
+        slog::Level::Warning => &WarnCallsite,
+        slog::Level::Error => &ErrorCallsite,
+        slog::Level::Critical => &ErrorCallsite,
     }
 }
 
-macro_rules! slog_cs {
-    ($level:expr, $cs:ident, $meta:ident, $ty:ident) => {
-        struct $ty;
-        static $cs: $ty = $ty;
+trait BridgeCallsite {
+    fn field(&self, field_name: &str) -> field::Field;
+    fn callsite(&'static self) -> &'static dyn callsite::Callsite;
+}
+
+macro_rules! level_callsite {
+    ($callsite:ident, $level:expr, $meta:ident) => {
+        struct $callsite;
         static $meta: Metadata<'static> = Metadata::new(
             "slog event",
             "slog",
             $level,
+            // File, line, and module all need to be statically defined. To provide these, they need to
+            // be exposed separately and subscribers need to be aware of where to get them
             None,
             None,
             None,
-            field::FieldSet::new(FIELD_NAMES, identify_callsite!(&$cs)),
+            field::FieldSet::new(FIELD_NAMES, identify_callsite!(&$callsite)),
             Kind::EVENT,
         );
 
-        impl callsite::Callsite for $ty {
+        impl BridgeCallsite for $callsite {
+            fn field(&self, field_name: &str) -> field::Field {
+                self.metadata().fields().field(field_name).unwrap()
+            }
+
+            fn callsite(&'static self) -> &'static dyn callsite::Callsite {
+                self
+            }
+        }
+
+        impl callsite::Callsite for $callsite {
             fn set_interest(&self, _: subscriber::Interest) {}
             fn metadata(&self) -> &'static Metadata<'static> {
                 &$meta
@@ -138,108 +126,8 @@ macro_rules! slog_cs {
     };
 }
 
-slog_cs!(
-    tracing_core::Level::TRACE,
-    TRACE_CS,
-    TRACE_META,
-    TraceCallsite
-);
-
-slog_cs!(
-    tracing_core::Level::DEBUG,
-    DEBUG_CS,
-    DEBUG_META,
-    DebugCallsite
-);
-
-slog_cs!(tracing_core::Level::INFO, INFO_CS, INFO_META, InfoCallsite);
-
-slog_cs!(tracing_core::Level::WARN, WARN_CS, WARN_META, WarnCallsite);
-
-slog_cs!(
-    tracing_core::Level::ERROR,
-    ERROR_CS,
-    ERROR_META,
-    ErrorCallsite
-);
-
-static TRACE_FIELDS: Lazy<Fields> = Lazy::new(|| Fields::new(&TRACE_CS));
-static DEBUG_FIELDS: Lazy<Fields> = Lazy::new(|| Fields::new(&DEBUG_CS));
-static INFO_FIELDS: Lazy<Fields> = Lazy::new(|| Fields::new(&INFO_CS));
-static WARN_FIELDS: Lazy<Fields> = Lazy::new(|| Fields::new(&WARN_CS));
-static ERROR_FIELDS: Lazy<Fields> = Lazy::new(|| Fields::new(&ERROR_CS));
-
-fn sloglevel_to_cs(
-    level: slog::Level,
-) -> (
-    &'static dyn callsite::Callsite,
-    &'static Fields,
-    &'static Metadata<'static>,
-) {
-    match level {
-        slog::Level::Trace => (&TRACE_CS, &*TRACE_FIELDS, &TRACE_META),
-        slog::Level::Debug => (&DEBUG_CS, &*DEBUG_FIELDS, &DEBUG_META),
-        slog::Level::Info => (&INFO_CS, &*INFO_FIELDS, &INFO_META),
-        slog::Level::Warning => (&WARN_CS, &*WARN_FIELDS, &WARN_META),
-        slog::Level::Error | slog::Level::Critical => (&ERROR_CS, &*ERROR_FIELDS, &ERROR_META),
-    }
-}
-
-fn sloglevel_to_trace(level: slog::Level) -> Level {
-    match level {
-        slog::Level::Trace => Level::TRACE,
-        slog::Level::Debug => Level::DEBUG,
-        slog::Level::Info => Level::INFO,
-        slog::Level::Warning => Level::WARN,
-        slog::Level::Error | slog::Level::Critical => Level::ERROR,
-    }
-}
-
-fn slogrecord_to_trace<'a>(record: &'a slog::Record<'a>) -> Metadata<'a> {
-    let cs_id = identify_callsite!(sloglevel_to_cs(record.level()).0);
-    let target = get_target(record);
-
-    Metadata::new(
-        "slog record",
-        target,
-        sloglevel_to_trace(record.level()),
-        Some(record.file()),
-        Some(record.line()),
-        Some(record.module()),
-        field::FieldSet::new(FIELD_NAMES, cs_id),
-        Kind::EVENT,
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::TracingSlogDrain;
-    use slog::*;
-    use tracing_test::traced_test;
-
-    #[test]
-    #[traced_test]
-    fn basic() {
-        let drain = TracingSlogDrain;
-        let root = Logger::root(drain, o!());
-
-        info!(root, "slog test"; "arg1" => "val1");
-        assert!(logs_contain("slog test"));
-    }
-
-    mod nested_mod {
-        pub fn log_as_info(slogger: &slog::Logger) {
-            slog::info!(slogger, "slog test");
-        }
-    }
-
-    #[test]
-    #[traced_test]
-    fn nested() {
-        let drain = TracingSlogDrain;
-        let root = Logger::root(drain, o!());
-
-        nested_mod::log_as_info(&root);
-        assert!(logs_contain("nested_mod"));
-    }
-}
+level_callsite!(TraceCallsite, Level::TRACE, TRACE_META);
+level_callsite!(DebugCallsite, Level::DEBUG, DEBUG_META);
+level_callsite!(InfoCallsite, Level::INFO, INFO_META);
+level_callsite!(WarnCallsite, Level::WARN, WARN_META);
+level_callsite!(ErrorCallsite, Level::ERROR, ERROR_META);

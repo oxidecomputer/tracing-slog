@@ -10,7 +10,7 @@ mod nested {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let drain = TracingSlogDrain;
-    let slogger = slog::Logger::root(drain, slog::o!());
+    let slogger = slog::Logger::root(drain, slog::o!("alpha" => "beta"));
 
     TracingSubscriber::builder()
         .with_env_filter(TracingEnvFilter::from_default_env())

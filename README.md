@@ -1,5 +1,12 @@
 # tracing-slog
 
+This fork adds support for forwarding key/value pairs from slog to tracing. It is currently experimental and depends on the [`valuable`](https://docs.rs/valuable/latest/valuable/index.html) crate and the `tracing_unstable` build flag.
+
+**Limitations**
+All key/value pairs are merged into a single hashmap and reported back as a single `kv` generic value. When serializing to JSON, this means that the value for the `kv` key is a JSON blob encoded as a string as opposed to a nested structure.
+
+---
+
 Adapters for connecting structured log records from the [`slog`](https://github.com/slog-rs/slog) crate
 into the [`tracing`](https://github.com/tokio-rs/tracing) ecosystem.
 
