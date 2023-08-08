@@ -12,8 +12,6 @@ pub struct Bridge {
 
 impl Serializer for Bridge {
     fn emit_arguments(&mut self, key: Key, val: &std::fmt::Arguments) -> slog::Result {
-        println!("{} {}", key, val);
-
         self.values.insert(format!("{}", key), format!("{}", val));
         Ok(())
     }
