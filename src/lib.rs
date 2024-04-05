@@ -4,6 +4,7 @@ use tracing_core::{
     callsite, dispatcher, field, identify_callsite, subscriber, Callsite, Event, Kind, Level,
     Metadata,
 };
+#[cfg(feature = "valuable")]
 use valuable::Valuable;
 
 pub struct Bridge {
@@ -40,6 +41,14 @@ impl Drain for TracingSlogDrain {
                 values.serialize(record, &mut serializer).unwrap();
                 record.kv().serialize(record, &mut serializer).unwrap();
 
+                #[cfg(feature = "valuable")]
+                let map_value = Some(&serializer.values.as_value());
+
+                #[cfg(not(feature = "valuable"))]
+                let map_value = serializer.values.iter().map(|(key, value)| {
+                    format!("{}: {}", key, value)
+                }).collect::<Vec<_>>().join(",");
+
                 dispatch.event(&Event::new(
                     cs.metadata(),
                     &cs.metadata().fields().value_set(&[
@@ -51,10 +60,7 @@ impl Drain for TracingSlogDrain {
                         (&bridge.field("slog.file"), Some(&record.file())),
                         (&bridge.field("slog.line"), Some(&record.line())),
                         (&bridge.field("slog.column"), Some(&record.column())),
-                        (
-                            &bridge.field("slog.kv"),
-                            Some(&serializer.values.as_value()),
-                        ),
+                        (&bridge.field("slog.kv"), Some(&map_value)),
                     ]),
                 ));
             }
